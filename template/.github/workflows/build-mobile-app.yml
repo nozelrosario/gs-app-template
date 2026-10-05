@@ -1,0 +1,276 @@
+name: Build Mobile App
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'packages/mobile-app/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        default: 'uat'
+        type: choice
+        options:
+          - uat
+          - production
+      build_engine:
+        description: 'Build Engine (Cloud=EAS, Local=GitHub Runner for Android only)'
+        required: true
+        default: 'local'
+        type: choice
+        options:
+          - cloud
+          - local
+      platform:
+        description: 'Build Platform'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - android
+          - ios
+          - all
+      version_bump:
+        description: 'Version Bump'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: packages/mobile-app
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Java (JDK 17)
+        if: github.event.inputs.build_engine == 'local'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        if: github.event.inputs.build_engine == 'local'
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Resolve Environment & Semantic Versioning
+        id: resolve-env
+        env:
+          INPUT_ENV: ${{ github.event.inputs.environment }}
+          INPUT_VERSION_BUMP: ${{ github.event.inputs.version_bump }}
+          INPUT_ENGINE: ${{ github.event.inputs.build_engine || 'local' }}
+          INPUT_PLATFORM: ${{ github.event.inputs.platform || 'android' }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            let pkg = { version: '1.0.0', name: 'app' };
+            try { pkg = JSON.parse(fs.readFileSync('package.json', 'utf8')); } catch(e){}
+            const baseVersion = pkg.version || '1.0.0';
+            const parts = baseVersion.split('.').map(n => parseInt(n, 10) || 0);
+            while (parts.length < 3) parts.push(0);
+            let [major, minor, patch] = parts;
+
+            const refName = process.env.GITHUB_REF_NAME || '';
+            const isTag = process.env.GITHUB_REF_TYPE === 'tag' || (refName.startsWith('v') && /^[0-9]/.test(refName.slice(1)));
+            const inputEnv = (process.env.INPUT_ENV || '').toLowerCase();
+            const inputBump = (process.env.INPUT_VERSION_BUMP || 'auto').toLowerCase();
+            const inputEngine = (process.env.INPUT_ENGINE || 'local').toLowerCase();
+            const inputPlatform = process.env.INPUT_PLATFORM ? process.env.INPUT_PLATFORM.toLowerCase() : (inputEngine === 'cloud' ? 'all' : 'android');
+            const runNumber = process.env.GITHUB_RUN_NUMBER || '1';
+
+            let isProd = false;
+            if (isTag) {
+              isProd = true;
+            } else if (refName === 'main' && (inputEnv.includes('production') || inputEnv.includes('prod') || inputEnv.includes('auto') || !inputEnv)) {
+              isProd = true;
+            } else if (inputEnv.includes('production') || inputEnv.includes('prod')) {
+              isProd = true;
+            }
+
+            let semver;
+            let isBumped = false;
+            if (isTag) {
+              semver = refName.replace(/^v/, '');
+            } else if (inputBump.includes('major')) {
+              semver = \`\${major + 1}.0.0\`;
+              isBumped = true;
+            } else if (inputBump.includes('minor')) {
+              semver = \`\${major}.\${minor + 1}.0\`;
+              isBumped = true;
+            } else if (inputBump.includes('patch')) {
+              semver = \`\${major}.\${minor}.\${patch + 1}\`;
+              isBumped = true;
+            } else {
+              semver = \`\${major}.\${minor}.\${patch}\`;
+            }
+
+            let appVersion;
+            let releaseTag;
+            let releaseName;
+            let isPrerelease;
+            let apkName;
+            let ipaName;
+            let envLabel;
+            let appEnv;
+            let profile;
+
+            if (isProd) {
+              appEnv = 'prod';
+              profile = 'production';
+              envLabel = 'PROD';
+              appVersion = semver;
+              releaseTag = \`v\${semver}\`;
+              releaseName = \`Production Release v\${semver}\`;
+              isPrerelease = false;
+              apkName = \`app-v\${semver}-b\${runNumber}-\${inputEngine}.apk\`;
+              ipaName = \`app-v\${semver}-b\${runNumber}-\${inputEngine}.ipa\`;
+            } else {
+              appEnv = 'uat';
+              profile = 'uat';
+              envLabel = 'UAT';
+              // iOS requires strict semver for APP_VERSION, cannot have suffixes
+              appVersion = semver;
+              releaseTag = \`v\${semver}-uat.\${runNumber}\`;
+              releaseName = \`UAT Pre-Release v\${semver}-uat.\${runNumber}\`;
+              isPrerelease = true;
+              apkName = \`app-uat-v\${semver}-b\${runNumber}-\${inputEngine}.apk\`;
+              ipaName = \`app-uat-v\${semver}-b\${runNumber}-\${inputEngine}.ipa\`;
+            }
+
+            console.log('--- BUILD TELEMETRY ---');
+            console.log(\`Engine             : \${inputEngine.toUpperCase()}\`);
+            console.log(\`Platform           : \${inputPlatform.toUpperCase()}\`);
+            console.log(\`Target Environment : \${appEnv.toUpperCase()} (\${envLabel})\`);
+            console.log(\`EAS Profile        : \${profile}\`);
+            console.log(\`App Version String : \${appVersion}\`);
+            console.log(\`Version Code (b#)  : \${runNumber}\`);
+            console.log('-----------------------');
+
+            const outputs = [
+              \`build_engine=\${inputEngine}\`,
+              \`platform=\${inputPlatform}\`,
+              \`app_env=\${appEnv}\`,
+              \`profile=\${profile}\`,
+              \`env_label=\${envLabel}\`,
+              \`app_version=\${appVersion}\`,
+              \`semver=\${semver}\`,
+              \`build_number=\${runNumber}\`,
+              \`apk_name=\${apkName}\`,
+              \`ipa_name=\${ipaName}\`,
+              \`release_tag=\${releaseTag}\`,
+              \`release_name=\${releaseName}\`,
+              \`is_prerelease=\${isPrerelease}\`,
+              \`make_latest=\${isProd ? 'true' : 'false'}\`
+            ];
+
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, outputs.join('\n') + '\n');
+          "
+
+      - name: Install dependencies
+        run: npm ci
+
+      # --- CLOUD BUILD (EAS) ---
+      - name: Setup EAS CLI
+        if: steps.resolve-env.outputs.build_engine == 'cloud'
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          packager: npm
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Build on EAS (Cloud)
+        id: eas-build
+        if: steps.resolve-env.outputs.build_engine == 'cloud'
+        env:
+          APP_ENV: ${{ steps.resolve-env.outputs.app_env }}
+          APP_VERSION: ${{ steps.resolve-env.outputs.app_version }}
+          APP_BUILD_NUMBER: ${{ steps.resolve-env.outputs.build_number }}
+        run: |
+          eas build --platform ${{ steps.resolve-env.outputs.platform }} --profile ${{ steps.resolve-env.outputs.profile }} --non-interactive --wait --json > eas-build-output.json
+          
+          ANDROID_URL=$(jq -r '.[] | select(.platform=="ANDROID") | .artifacts.buildUrl // .artifacts.applicationArchiveUrl // empty' eas-build-output.json)
+          IOS_URL=$(jq -r '.[] | select(.platform=="IOS") | .artifacts.buildUrl // .artifacts.applicationArchiveUrl // empty' eas-build-output.json)
+          
+          echo "android_url=$ANDROID_URL" >> $GITHUB_OUTPUT
+          echo "ios_url=$IOS_URL" >> $GITHUB_OUTPUT
+
+      - name: Download Cloud Artifacts
+        if: steps.resolve-env.outputs.build_engine == 'cloud'
+        run: |
+          mkdir -p builds
+          if [ -n "${{ steps.eas-build.outputs.android_url }}" ]; then
+            wget -q -O "builds/${{ steps.resolve-env.outputs.apk_name }}" "${{ steps.eas-build.outputs.android_url }}"
+          fi
+          if [ -n "${{ steps.eas-build.outputs.ios_url }}" ]; then
+            wget -q -O "builds/${{ steps.resolve-env.outputs.ipa_name }}" "${{ steps.eas-build.outputs.ios_url }}"
+          fi
+
+      # --- LOCAL BUILD (GitHub Runner) ---
+      - name: Expo Prebuild (Generate Native Android Project)
+        if: steps.resolve-env.outputs.build_engine == 'local'
+        env:
+          APP_ENV: ${{ steps.resolve-env.outputs.app_env }}
+          APP_VERSION: ${{ steps.resolve-env.outputs.app_version }}
+          APP_BUILD_NUMBER: ${{ steps.resolve-env.outputs.build_number }}
+        run: npx expo prebuild --platform android --clean
+
+      - name: Build Android APK via Gradle (Local)
+        if: steps.resolve-env.outputs.build_engine == 'local'
+        env:
+          APP_ENV: ${{ steps.resolve-env.outputs.app_env }}
+          APP_VERSION: ${{ steps.resolve-env.outputs.app_version }}
+          APP_BUILD_NUMBER: ${{ steps.resolve-env.outputs.build_number }}
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=512m"
+        run: |
+          cd android
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Prepare Local Artifact
+        if: steps.resolve-env.outputs.build_engine == 'local'
+        run: |
+          mkdir -p builds
+          APK_PATH=$(find android/app/build/outputs/apk -type f -name "*.apk" | head -n 1)
+          cp "$APK_PATH" "builds/${{ steps.resolve-env.outputs.apk_name }}"
+
+      # --- PUBLISH ---
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve-env.outputs.release_tag }}
+          name: ${{ steps.resolve-env.outputs.release_name }}
+          prerelease: ${{ steps.resolve-env.outputs.is_prerelease == 'true' }}
+          make_latest: ${{ steps.resolve-env.outputs.make_latest }}
+          files: packages/mobile-app/builds/*
+          body: |
+            ### 📱 ${{ steps.resolve-env.outputs.release_name }}
+            - **Environment:** `${{ steps.resolve-env.outputs.env_label }}`
+            - **App Version:** `${{ steps.resolve-env.outputs.app_version }}`
+            - **Version Code:** `${{ steps.resolve-env.outputs.build_number }}`
+            - **Build Engine:** ${{ steps.resolve-env.outputs.build_engine == 'cloud' && 'EAS Cloud' || 'GitHub Local Runner' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

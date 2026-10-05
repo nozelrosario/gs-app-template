@@ -1,0 +1,69 @@
+name: Deploy Web Portal to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'packages/web-portal/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (Production source)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: _source_prod
+
+      - name: Checkout develop (UAT source)
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          path: _source_uat
+        continue-on-error: true
+
+      - name: Build composite deployment
+        run: |
+          mkdir -p _site/uat
+
+          echo "📦 Copying Production files from main → _site/"
+          if [ -d _source_prod/packages/web-portal ]; then
+            cp -r _source_prod/packages/web-portal/* _site/
+          fi
+
+          if [ -d _source_uat/packages/web-portal ]; then
+            echo "📦 Copying UAT files from develop → _site/uat/"
+            cp -r _source_uat/packages/web-portal/* _site/uat/
+          else
+            echo "⚠️ develop branch not found or missing web-portal"
+          fi
+
+          touch _site/.nojekyll
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '_site'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
